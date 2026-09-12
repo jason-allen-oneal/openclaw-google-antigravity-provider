@@ -1,4 +1,4 @@
-import type { ProviderPlugin } from "openclaw/plugin-sdk/provider-model-shared";
+import type { ProviderPlugin } from "openclaw/plugin-sdk/plugin-entry";
 import {
   buildAntigravityProviderCatalog,
   GOOGLE_ANTIGRAVITY_AUTH_MARKER,

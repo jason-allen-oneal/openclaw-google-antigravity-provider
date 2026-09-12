@@ -36,7 +36,7 @@ describe("probeAgy", () => {
     }
   });
 
-  it("handles non-zero exit status", () => {
+  it("reports not-found when the existence check exits non-zero", () => {
     const mockRunner = () => ({
       status: 1,
       stdout: "",
@@ -49,7 +49,23 @@ describe("probeAgy", () => {
     const result = probeAgy(mockRunner);
     expect(result.ok).toBe(false);
     if (!result.ok) {
-      expect(result.reason).toContain("exited with status 1");
+      expect(result.reason).toContain("not found on PATH");
+    }
+  });
+
+  it("succeeds when `which agy` returns a resolved path", () => {
+    const mockRunner = () => ({
+      status: 0,
+      stdout: "/usr/local/bin/agy\n",
+      stderr: "",
+      output: [],
+      pid: 1234,
+      signal: null,
+    });
+    const result = probeAgy(mockRunner);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.helpText).toContain("/usr/local/bin/agy");
     }
   });
 });

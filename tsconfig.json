@@ -11,8 +11,10 @@
     "declaration": true,
     "declarationMap": true,
     "sourceMap": true,
+    "rewriteRelativeImportExtensions": true,
     "outDir": "./dist",
     "rootDir": "./src"
   },
-  "include": ["src/**/*"]
+  "include": ["src/**/*"],
+  "exclude": ["src/package-entry.test.ts"]
 }

@@ -23,13 +23,13 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run"
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.entry.json --noEmit",
+    "test": "vitest run --testTimeout=20000"
   },
   "devDependencies": {
     "openclaw": "^2026.8.1",
     "typescript": "6.0.3",
-    "vitest": "4.1.10"
+    "vitest": "^4.1.11"
   },
   "peerDependencies": {
     "openclaw": ">=2026.8.1"

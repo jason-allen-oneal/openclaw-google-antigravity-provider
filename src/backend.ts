@@ -1,8 +1,11 @@
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import os from "node:os";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { DEFAULT_PRINT_TIMEOUT, formatGoDuration } from "./config.js";
+import { applyOpenClawMcpBridge, resolveAgyMcpConfigPath } from "./mcp-bridge.js";
 
 type CliBackendPlugin = Parameters<OpenClawPluginApi["registerCliBackend"]>[0];
 type CliBackendConfig = CliBackendPlugin["config"];
@@ -14,20 +17,78 @@ type CliBackendResolveExecutionArgsContext = Parameters<
 >[0];
 
 export const GOOGLE_ANTIGRAVITY_PROVIDER_ID = "google-antigravity-cli";
+
+// How agy is allowed to run tools. agy cannot prompt for a permission in
+// headless `--print` mode — it auto-denies and returns
+//   "a tool required the \"read_file\" permission that headless mode cannot
+//    prompt for, so it was auto-denied"
+// so *some* policy has to be chosen up front.
+//
+//   skip     `--dangerously-skip-permissions`; auto-approves every tool.
+//            Default, because it is the only mode that works out of the box.
+//   sandbox  `--sandbox`; agy runs with terminal restrictions enabled.
+//   settings neither flag; agy falls back to `permissions.allow` in
+//            ~/.gemini/antigravity-cli/settings.json, which is the least
+//            privileged option but needs rules for the tools you expect.
+export type AntigravityPermissionMode = "skip" | "sandbox" | "settings";
+
+export const SKIP_PERMISSIONS_FLAG = "--dangerously-skip-permissions";
+export const SANDBOX_FLAG = "--sandbox";
+export const DEFAULT_PERMISSION_MODE: AntigravityPermissionMode = "skip";
+
+export function resolvePermissionMode(
+  value: unknown,
+): AntigravityPermissionMode {
+  return value === "sandbox" || value === "settings" || value === "skip"
+    ? value
+    : DEFAULT_PERMISSION_MODE;
+}
+
+// Rewrites whichever permission flag the base args carry into the configured
+// mode, so a user override is honoured without the caller having to know which
+// flag the defaults happened to ship with.
+export function applyPermissionMode(
+  args: readonly string[],
+  mode: AntigravityPermissionMode,
+): string[] {
+  const stripped = args.filter(
+    (arg) => arg !== SKIP_PERMISSIONS_FLAG && arg !== SANDBOX_FLAG,
+  );
+  if (mode === "skip") stripped.push(SKIP_PERMISSIONS_FLAG);
+  else if (mode === "sandbox") stripped.push(SANDBOX_FLAG);
+  return stripped;
+}
 export const GOOGLE_ANTIGRAVITY_DEFAULT_MODEL_REF =
-  "google-antigravity-cli/gemini-3.7-flash-medium";
+  "google-antigravity-cli/gemini-3.7-flash";
 
 export const GOOGLE_ANTIGRAVITY_MODEL_ALIASES: Record<string, string> = {
-  flash: "gemini-3.7-flash-medium",
+  // Bare shortcuts map to the base family, where the thinking-level slider
+  // supplies the effort at execution time. Shortcuts that *name* an effort
+  // resolve to the matching effort-baked id instead — collapsing them to the
+  // base family would drop the level the user explicitly asked for and let
+  // the slider silently override it.
+  flash: "gemini-3.7-flash",
   "flash-high": "gemini-3.7-flash-high",
   "flash-medium": "gemini-3.7-flash-medium",
   "flash-low": "gemini-3.7-flash-low",
-  pro: "gemini-3.1-pro-high",
+  pro: "gemini-3.1-pro",
+  // agy publishes Pro as high/low only — there is no `gemini-3.1-pro-medium`.
   "pro-low": "gemini-3.1-pro-low",
   "pro-high": "gemini-3.1-pro-high",
-  sonnet: "claude-sonnet-4.6",
-  opus: "claude-opus-4.6",
-  gpt: "gpt-oss-120b",
+  sonnet: "claude-sonnet-4-6",
+  opus: "claude-opus-4-6-thinking",
+  gpt: "gpt-oss-120b-medium",
+  // Base identity aliases (canonical).
+  "gemini-3.8-flash": "gemini-3.8-flash",
+  "gemini-3.7-flash": "gemini-3.7-flash",
+  "gemini-3.6-flash": "gemini-3.6-flash",
+  "gemini-3.1-pro": "gemini-3.1-pro",
+  "claude-sonnet-4-6": "claude-sonnet-4-6",
+  "claude-opus-4-6-thinking": "claude-opus-4-6-thinking",
+  "gpt-oss-120b-medium": "gpt-oss-120b-medium",
+  // Effort-baked identity aliases kept for existing configs: agy still
+  // accepts them, and the ID already carries the effort so nothing extra
+  // needs to be injected.
   "gemini-3.8-flash-high": "gemini-3.8-flash-high",
   "gemini-3.8-flash-medium": "gemini-3.8-flash-medium",
   "gemini-3.8-flash-low": "gemini-3.8-flash-low",
@@ -39,10 +100,104 @@ export const GOOGLE_ANTIGRAVITY_MODEL_ALIASES: Record<string, string> = {
   "gemini-3.6-flash-low": "gemini-3.6-flash-low",
   "gemini-3.1-pro-low": "gemini-3.1-pro-low",
   "gemini-3.1-pro-high": "gemini-3.1-pro-high",
+  // Legacy dotted aliases from earlier README examples.
   "claude-sonnet-4.6": "claude-sonnet-4-6",
   "claude-opus-4.6": "claude-opus-4-6-thinking",
   "gpt-oss-120b": "gpt-oss-120b-medium",
 };
+
+export type AgyEffort = "low" | "medium" | "high";
+
+// Effort used when a model needs `--effort` but openclaw gave us no usable
+// thinking level. agy has no "off", so the slider being off or unset lands on
+// its cheapest setting rather than silently upgrading the request.
+export const DEFAULT_AGY_EFFORT: AgyEffort = "low";
+
+// Openclaw exposes eight canonical thinking levels; agy accepts three.
+// `off`/`minimal`/`low` → `low`, `medium`/`adaptive` → `medium`,
+// `high`/`xhigh`/`max` → `high`. An unrecognized or missing level returns
+// `undefined`; callers that must supply an effort fall back to
+// DEFAULT_AGY_EFFORT.
+export function mapThinkingLevelToAgyEffort(
+  level?: string,
+): AgyEffort | undefined {
+  switch (level) {
+    case "off":
+    case "minimal":
+    case "low":
+      return "low";
+    case "medium":
+    case "adaptive":
+      return "medium";
+    case "high":
+    case "xhigh":
+    case "max":
+      return "high";
+    default:
+      return undefined;
+  }
+}
+
+// Effort-baked model IDs (e.g. `gemini-3.7-flash-high`) already carry the
+// level via the ID itself; injecting `--effort` on top is redundant. Keep
+// the injection behavior strictly opt-in per model.
+export function modelIdHasBakedEffort(modelId: string): boolean {
+  if (!modelId.startsWith("gemini-")) return false;
+  return /-(?:high|medium|low)$/.test(modelId);
+}
+
+// Only the Gemini families take `--effort`. agy rejects the flag outright for
+// the others:
+//   invalid model selection (--model "claude-sonnet-4-6" --effort "high"):
+//   --effort is not supported for model "claude-sonnet-4-6"
+// GPT-OSS is published as `gpt-oss-120b-medium`, i.e. its level is part of the
+// id, so it needs nothing injected either.
+export function modelSupportsEffortFlag(modelId: string): boolean {
+  return modelId.startsWith("gemini-");
+}
+
+// Collapsed Gemini base ids do not exist in agy's own catalog — `agy models`
+// only lists the effort-baked rows — so agy refuses to run them bare:
+//   --model gemini-3.7-flash requires --effort (available: low, medium, high)
+// Any Gemini id without a baked suffix therefore *must* carry `--effort`.
+export function modelRequiresEffortFlag(modelId: string): boolean {
+  return modelSupportsEffortFlag(modelId) && !modelIdHasBakedEffort(modelId);
+}
+
+const EFFORT_ORDER: readonly AgyEffort[] = ["low", "medium", "high"];
+
+// Not every family offers all three levels. `agy models` lists Pro as only
+// `gemini-3.1-pro-high` and `gemini-3.1-pro-low`, and agy rejects the middle:
+//   invalid model selection (--model "gemini-3.1-pro" --effort "medium"):
+//   gemini-3.1-pro has no "medium" effort (available: low, high)
+// Families absent from this map are assumed to offer all three, which matches
+// every Flash row agy currently publishes.
+const MODEL_AVAILABLE_EFFORTS: Record<string, readonly AgyEffort[]> = {
+  "gemini-3.1-pro": ["low", "high"],
+};
+
+export function availableEffortsForModel(modelId: string): readonly AgyEffort[] {
+  return MODEL_AVAILABLE_EFFORTS[modelId] ?? EFFORT_ORDER;
+}
+
+// Snap a requested effort onto what the family actually supports. Ties break
+// downward, so a `medium` slider on Pro resolves to `low` rather than silently
+// upgrading the request to `high`.
+export function clampEffortForModel(modelId: string, effort: AgyEffort): AgyEffort {
+  const available = availableEffortsForModel(modelId);
+  if (available.includes(effort)) return effort;
+  const target = EFFORT_ORDER.indexOf(effort);
+  let best = available[0]!;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (const candidate of available) {
+    const distance = Math.abs(EFFORT_ORDER.indexOf(candidate) - target);
+    if (distance < bestDistance) {
+      best = candidate;
+      bestDistance = distance;
+    }
+  }
+  return best;
+}
 
 const CONVERSATION_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -79,11 +234,47 @@ export async function readConversationCache(
     if (isNodeError(error) && error.code === "ENOENT") return undefined;
     throw error;
   }
-  const parsed = JSON.parse(raw);
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error(`Antigravity conversation cache is not a JSON object: ${cachePath}`);
+  // agy writes this file synchronously at turn end but a killed / crashed
+  // process can leave it truncated. Treat malformed JSON the same as
+  // "cache missing" — the caller falls back to launching a fresh
+  // conversation instead of crashing the turn.
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[google-antigravity-cli] ignoring malformed conversation cache at ${cachePath}: ${
+        (error as Error).message
+      }`,
+    );
+    return undefined;
   }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
   return parsed as Record<string, string>;
+}
+
+// Windows and macOS both default to case-insensitive filesystems, so agy and
+// openclaw can name the same directory differently (`C:\\Users\\Chris` vs
+// `c:\\users\\chris`). Windows additionally accepts either separator. An exact
+// string miss here is not cosmetic: it makes captureSessionId throw, which
+// drops the session binding, restarts the agy conversation every turn, and
+// with it the accumulated prompt cache.
+const CASE_INSENSITIVE_FS =
+  process.platform === "win32" || process.platform === "darwin";
+
+function normalizeCwdKey(value: string): string {
+  // path.normalize is platform-native, so it unifies separators on Windows
+  // and leaves POSIX paths alone. Trailing separators are dropped so
+  // `/work` and `/work/` compare equal.
+  const normalized = path.normalize(value).replace(/[\\/]+$/, "");
+  return CASE_INSENSITIVE_FS ? normalized.toLowerCase() : normalized;
+}
+
+function validConversationId(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return CONVERSATION_ID_PATTERN.test(trimmed) ? trimmed : undefined;
 }
 
 export async function resolveCachedConversationId(params: {
@@ -96,11 +287,20 @@ export async function resolveCachedConversationId(params: {
   try {
     cwdCandidates.add(await fs.realpath(params.cwd));
   } catch {}
+
+  // Exact match first: cheapest, and authoritative when agy wrote the key
+  // exactly as openclaw spells it.
   for (const cwd of cwdCandidates) {
-    const value = cache[cwd];
-    if (typeof value === "string" && CONVERSATION_ID_PATTERN.test(value.trim())) {
-      return value.trim();
-    }
+    const exact = validConversationId(cache[cwd]);
+    if (exact) return exact;
+  }
+
+  // Then a normalized sweep for separator, trailing-slash, and case drift.
+  const wanted = new Set([...cwdCandidates].map(normalizeCwdKey));
+  for (const [key, value] of Object.entries(cache)) {
+    if (!wanted.has(normalizeCwdKey(key))) continue;
+    const match = validConversationId(value);
+    if (match) return match;
   }
   return undefined;
 }
@@ -250,7 +450,8 @@ export function parseGoogleAntigravityJsonlEvent(
     } else {
       events.push({
         kind: "result",
-        text: typeof res.response === "string" ? res.response : "",
+        text:
+          typeof res.response === "string" ? res.response : "",
         sessionId: typeof res.conversation_id === "string" ? res.conversation_id : undefined,
         usage,
       });
@@ -283,6 +484,22 @@ export function normalizeGoogleAntigravityBackendConfig(
     pluginConfig?.stream === true ||
     pluginConfig?.streaming === true;
 
+  const streamDisabled =
+    backendConfig?.stream === false ||
+    backendConfig?.streaming === false ||
+    pluginConfig?.stream === false ||
+    pluginConfig?.streaming === false ||
+    backendConfig?.output === "text" ||
+    backendConfig?.outputFormat === "text";
+
+  if (streamDisabled) {
+    return {
+      ...config,
+      output: "text",
+      resumeOutput: "text",
+    };
+  }
+
   if (streamEnabled) {
     return {
       ...config,
@@ -294,8 +511,60 @@ export function normalizeGoogleAntigravityBackendConfig(
   return config;
 }
 
+// agy stores every subagent invocation, every task-status update and every
+// `manage_task` result forever in the conversation's SQLite (see the
+// step_type histogram in docs/AGY_STEP_SCHEMA.md — a chat with a lot of
+// background work can hit millions of tokens of replay just from that).
+// When we `--conversation <id>` into such a DB agy replays *everything*
+// on the next turn, blowing the model's context window. Above this
+// byte threshold we drop `--conversation` so agy starts a fresh
+// conversation; the openclaw catch-up hook then re-seeds the recent
+// turns it needs to keep going.
+export const DEFAULT_MAX_RESUME_DB_BYTES = 2_000_000;
+
+export function resumeGuardEnabled(
+  pluginConfig: Record<string, any> | undefined,
+  backendConfig: Record<string, any> | undefined,
+): { enabled: boolean; limitBytes: number } {
+  const raw =
+    backendConfig?.maxResumeDbBytes ??
+    pluginConfig?.maxResumeDbBytes;
+  if (raw === false) return { enabled: false, limitBytes: 0 };
+  const n = typeof raw === "number" && raw > 0 ? raw : DEFAULT_MAX_RESUME_DB_BYTES;
+  return { enabled: true, limitBytes: n };
+}
+
+// If `--conversation <id>` is in `args` and its SQLite on disk is over
+// `limitBytes`, strip both tokens so agy starts a fresh conversation.
+// Returns the resulting args and, on drop, the conversation id + size for
+// logging.
+export function dropOversizedResume(
+  args: readonly string[],
+  dataDir: string,
+  limitBytes: number,
+): { args: string[]; dropped?: { conversationId: string; bytes: number } } {
+  const flagIdx = args.indexOf("--conversation");
+  if (flagIdx < 0 || flagIdx + 1 >= args.length) return { args: [...args] };
+  const conversationId = args[flagIdx + 1]!;
+  if (!conversationId || conversationId.startsWith("{")) return { args: [...args] };
+  const dbPath = path.join(dataDir, "conversations", `${conversationId}.db`);
+  let bytes = 0;
+  try {
+    bytes = fsSync.statSync(dbPath).size;
+  } catch {
+    // Missing db: let agy handle it (it'll recreate). Don't strip — the
+    // caller may have deliberately named a conversation that will be
+    // created on this run.
+    return { args: [...args] };
+  }
+  if (bytes <= limitBytes) return { args: [...args] };
+  const next = args.slice(0, flagIdx).concat(args.slice(flagIdx + 2));
+  return { args: next, dropped: { conversationId, bytes } };
+}
+
 export function resolveGoogleAntigravityExecutionArgs(
   context: CliBackendResolveExecutionArgsContext,
+  options: { dataDir?: string; env?: NodeJS.ProcessEnv } = {},
 ): string[] {
   const cfg = context.config as Record<string, any> | undefined;
   const providerId = context.provider || GOOGLE_ANTIGRAVITY_PROVIDER_ID;
@@ -314,7 +583,27 @@ export function resolveGoogleAntigravityExecutionArgs(
     cfg?.agents?.defaults?.timeoutSeconds;
 
   const timeoutStr = formatGoDuration(configuredTimeout, DEFAULT_PRINT_TIMEOUT);
-  const args = [...context.baseArgs];
+  let args = applyPermissionMode(
+    context.baseArgs,
+    resolvePermissionMode(
+      backendConfig?.permissionMode ?? pluginConfig?.permissionMode,
+    ),
+  );
+
+  const guard = resumeGuardEnabled(pluginConfig, backendConfig);
+  if (guard.enabled) {
+    const dataDir = options.dataDir ?? resolveAntigravityDataDir(options.env ?? process.env);
+    const guarded = dropOversizedResume(args, dataDir, guard.limitBytes);
+    args = guarded.args;
+    if (guarded.dropped) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[google-antigravity-cli] dropping --conversation ${guarded.dropped.conversationId} ` +
+          `(${(guarded.dropped.bytes / 1_000_000).toFixed(1)}MB > ${(guard.limitBytes / 1_000_000).toFixed(1)}MB cap); ` +
+          `agy will start a fresh conversation and openclaw's catch-up hook will re-seed recent turns.`,
+      );
+    }
+  }
   const timeoutIndex = args.indexOf("--print-timeout");
 
   if (timeoutIndex !== -1 && timeoutIndex + 1 < args.length) {
@@ -332,11 +621,71 @@ export function resolveGoogleAntigravityExecutionArgs(
     backendConfig?.output === "text" ||
     backendConfig?.outputFormat === "text";
 
-  if (!streamDisabled && !args.includes("--output-format")) {
+  if (streamDisabled) {
+    const outputIndex = args.indexOf("--output-format");
+    if (outputIndex !== -1) {
+      args.splice(outputIndex, outputIndex + 1 < args.length ? 2 : 1);
+    }
+  } else if (!args.includes("--output-format")) {
     args.push("--output-format", "stream-json");
   }
 
+  // Wire openclaw's thinking-level slider into agy's `--effort` flag. Only
+  // collapsed Gemini base ids take the flag, and for them it is mandatory —
+  // agy refuses to run them without it. Every other family either rejects
+  // `--effort` outright (Claude) or bakes its level into the id (GPT-OSS,
+  // effort-suffixed Gemini rows), so they get nothing injected.
+  const rawModelId = context.modelId?.trim() ?? "";
+  const modelIdWithoutProvider = rawModelId.includes("/")
+    ? rawModelId.slice(rawModelId.lastIndexOf("/") + 1)
+    : rawModelId;
+  if (
+    modelRequiresEffortFlag(modelIdWithoutProvider) &&
+    !args.includes("--effort")
+  ) {
+    // The slider being off or unset resolves to DEFAULT_AGY_EFFORT rather
+    // than omitting the flag, which would make agy reject the run.
+    const requested =
+      mapThinkingLevelToAgyEffort(context.thinkingLevel) ?? DEFAULT_AGY_EFFORT;
+    args.push("--effort", clampEffortForModel(modelIdWithoutProvider, requested));
+  }
+
   return args;
+}
+
+// Publishing into agy's HOME-level MCP config is a shared-file side effect, so
+// it can be turned off without disabling the rest of the backend.
+export function exposeOpenClawTools(
+  cfg: Record<string, any> | undefined,
+  providerId?: string,
+): boolean {
+  const backendConfig =
+    cfg?.agents?.defaults?.cliBackends?.[providerId ?? GOOGLE_ANTIGRAVITY_PROVIDER_ID];
+  const pluginConfig = resolvePluginConfig(cfg, providerId);
+  const value = backendConfig?.exposeOpenClawTools ?? pluginConfig?.exposeOpenClawTools;
+  return value !== false;
+}
+
+// Resolves the strip-wrapper's on-disk path. The wrapper lives next to this
+// module in dist/. We prepend `node <wrapper>` to the args (instead of
+// relying on a `#!/usr/bin/env node` shebang) so exec-bit-less filesystems
+// (FAT/exFAT on USB transfers, some Windows shares) don't break spawn.
+function resolveAgyWrapperInvocation(): { command: string; wrapperPath: string | null } {
+  try {
+    const here = fileURLToPath(new URL(".", import.meta.url));
+    const wrapper = [
+      path.join(here, "agy-strip-wrapper.js"),
+      path.join(here, "agy-strip-wrapper.ts"),
+    ].find((candidate) => fsSync.existsSync(candidate));
+    return wrapper
+      ? { command: process.execPath, wrapperPath: wrapper }
+      : { command: "agy", wrapperPath: null };
+  } catch {
+    // If we can't resolve the wrapper (unlikely — the module has to load
+    // from somewhere), fall back to spawning raw agy. That drops the
+    // context-strip optimisation but preserves core functionality.
+    return { command: "agy", wrapperPath: null };
+  }
 }
 
 export function buildGoogleAntigravityCliBackend(
@@ -349,20 +698,50 @@ export function buildGoogleAntigravityCliBackend(
   const backend: CliBackendPlugin = {
     id: backendId,
     modelProvider: backendId,
-    liveTest: { defaultModelRef: `${backendId}/gemini-3.7-flash-medium` },
+    liveTest: { defaultModelRef: `${backendId}/gemini-3.7-flash` },
     nativeToolMode: "always-on",
     ownsNativeCompaction: true,
+    // Ask openclaw to stand up its loopback MCP server and materialise a
+    // config for this run. `gemini-system-settings` is the right mode of the
+    // three available: it injects no CLI args (agy would reject claude's
+    // `--mcp-config`/`--strict-mcp-config`), delivers the path through
+    // GEMINI_CLI_SYSTEM_SETTINGS_PATH in the child env where prepareExecution
+    // can read it, and resolves `${OPENCLAW_MCP_TOKEN}` to a literal before
+    // writing, which agy needs because it performs no placeholder expansion.
+    bundleMcp: true,
+    bundleMcpMode: "gemini-system-settings",
     normalizeConfig: normalizeGoogleAntigravityBackendConfig,
     resolveExecutionArgs: resolveGoogleAntigravityExecutionArgs,
-    prepareExecution: (ctx) => {
+    prepareExecution: async (ctx) => {
       const cwd = (ctx as { cwd?: string; workspaceDir: string }).cwd ?? ctx.workspaceDir;
       let priorConversationId: string | undefined;
       let stagedAtMs = 0;
 
+      // MCP bridge moved to src/agy-strip-wrapper.ts so it can read the
+      // POST-capture-attempt `GEMINI_CLI_SYSTEM_SETTINGS_PATH`. openclaw's
+      // `prepareCliBundleMcpCaptureAttempt` runs after our `prepareExecution`
+      // returns and updates the env var to point at a fresh settings file
+      // carrying the resolved `x-openclaw-cli-capture-key`; writing the
+      // bridge from here reads the pre-capture file (empty key → agy gets a
+      // 401 when it calls the loopback server).
+      const exposeTools = exposeOpenClawTools(
+        ctx.config as Record<string, any> | undefined,
+        backendId,
+      );
+
       return {
         ...(normalizeOptionalString(env.ANTIGRAVITY_USER_DATA_DIR)
-          ? { env: { ANTIGRAVITY_USER_DATA_DIR: userDataDir } }
-          : {}),
+          ? {
+              env: {
+                ANTIGRAVITY_USER_DATA_DIR: userDataDir,
+                OPENCLAW_ANTIGRAVITY_EXPOSE_TOOLS: String(exposeTools),
+              },
+            }
+          : {
+              env: {
+                OPENCLAW_ANTIGRAVITY_EXPOSE_TOOLS: String(exposeTools),
+              },
+            }),
         clearEnv: [
           "GEMINI_API_KEY",
           "GOOGLE_API_KEY",
@@ -416,9 +795,18 @@ export function buildGoogleAntigravityCliBackend(
         },
       } as any;
     },
-    config: {
-      command: "agy",
+    config: (() => {
+      // Point openclaw at `node <wrapper>` instead of raw agy so the
+      // openclaw:ctx channel-context blocks openclaw prepends to every turn
+      // are removed before agy sees the prompt. agy has its own conversation
+      // SQLite (`--conversation <id>`) so re-sending the channel context
+      // every turn is duplicate history — see src/prompt-strip.ts.
+      const wrap = resolveAgyWrapperInvocation();
+      const wrapperPrefix = wrap.wrapperPath ? [wrap.wrapperPath] : [];
+      return {
+      command: wrap.command,
       args: [
+        ...wrapperPrefix,
         "--print",
         "{prompt}",
         "--print-timeout",
@@ -428,6 +816,7 @@ export function buildGoogleAntigravityCliBackend(
         "--dangerously-skip-permissions",
       ],
       resumeArgs: [
+        ...wrapperPrefix,
         "--conversation",
         "{sessionId}",
         "--print",
@@ -440,73 +829,31 @@ export function buildGoogleAntigravityCliBackend(
       ],
       output: "jsonl",
       input: "arg",
+      // agy exposes no image flag and its stream-json input rejects non-text
+      // content blocks, so openclaw stages images and appends their paths to
+      // the prompt (the `imageArg`-unset path in its CLI runner). Staging into
+      // the workspace keeps them inside the directory agy is allowed to open
+      // with `view_file`; the "temp" scope would land outside it.
+      imagePathScope: "workspace",
       modelArg: "--model",
       modelAliases: GOOGLE_ANTIGRAVITY_MODEL_ALIASES,
       systemPromptWhen: "first",
       sessionMode: "existing",
       serialize: true,
-    },
+      };
+    })(),
   };
 
   (backend as any).parseJsonlEvent = parseGoogleAntigravityJsonlEvent;
-  (backend as any).manualCompaction = {
-    buildPrompt: (customInstructions?: string): string => {
-      const instructions = customInstructions?.trim();
-      const customPart = instructions ? ` Focus on: ${instructions}` : "";
-      return `Do not execute any tools or commands. Provide a concise summary and compaction of this conversation so far, preserving key decisions, active context, and current progress.${customPart}`;
-    },
-    input: "arg",
-    validateOutput: (rawOutput: string): { ok: boolean; reason?: string } => {
-      const trimmed = rawOutput.trim();
-      if (!trimmed) {
-        return {
-          ok: false,
-          reason: "Antigravity CLI returned empty output during compaction.",
-        };
-      }
-      if (
-        trimmed.includes("not found") &&
-        (trimmed.includes("conversation") || trimmed.includes("warning: conversation"))
-      ) {
-        return {
-          ok: false,
-          reason:
-            "Antigravity native conversation not found for this session. Send a message first to establish the conversation before compacting.",
-        };
-      }
-      for (const line of trimmed.split("\n")) {
-        const lineTrimmed = line.trim();
-        if (!lineTrimmed.startsWith("{")) continue;
-        try {
-          const record = JSON.parse(lineTrimmed);
-          if (record.event === "result" && record.result) {
-            if (record.result.status === "ERROR" || record.result.status === "FAILED") {
-              const err =
-                record.result.error ||
-                record.result.message ||
-                "Antigravity compaction error";
-              if (
-                err.toLowerCase().includes("context canceled") ||
-                err.toLowerCase().includes("not found")
-              ) {
-                return {
-                  ok: false,
-                  reason:
-                    "Antigravity native conversation not found or canceled. Send a message first to initialize the native conversation before compacting.",
-                };
-              }
-              return {
-                ok: false,
-                reason: err,
-              };
-            }
-            return { ok: true };
-          }
-        } catch {}
-      }
-      return { ok: true };
-    },
-  };
+  // No `manualCompaction`: agy exposes no compaction command. Its slash-command
+  // surface is /agents /changelog /config /credits /effort /help /hooks /model
+  // /permissions /skills /usage, with nothing that compacts, and `/compact` is
+  // answered as ordinary chat. A control operation that merely asked the model
+  // to "summarise this conversation" would *append* a summary turn rather than
+  // shrink anything, while reporting success to openclaw. The bundled
+  // google-gemini-cli backend takes the same shape: `ownsNativeCompaction`
+  // without a manual control operation, so `/compact` fails loudly instead of
+  // silently doing nothing.
 
   return backend;
 }
