@@ -1,6 +1,6 @@
 {
   "name": "google-antigravity-provider",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "description": "Google Antigravity CLI (agy) provider and agent runtime for OpenClaw",
   "type": "module",
   "author": "Jason Allen O'Neal",
