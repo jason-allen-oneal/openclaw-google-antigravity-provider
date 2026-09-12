@@ -14,10 +14,7 @@
     "url": "https://github.com/jason-allen-oneal/openclaw-google-antigravity-provider/issues"
   },
   "files": [
-    "plugin.ts",
-    "provider-discovery.ts",
-    "src",
-    "dist",
+    "dist/**/*.js",
     "openclaw.plugin.json",
     "README.md"
   ],
@@ -39,7 +36,7 @@
   },
   "openclaw": {
     "extensions": [
-      "./plugin.ts"
+      "./dist/index.js"
     ],
     "compat": {
       "pluginApi": ">=2026.8.1",

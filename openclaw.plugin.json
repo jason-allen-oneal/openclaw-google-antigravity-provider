@@ -6,7 +6,7 @@
   "activation": {
     "onStartup": false
   },
-  "providerCatalogEntry": "./provider-discovery.ts",
+  "providerCatalogEntry": "./dist/provider-discovery.js",
   "enabledByDefault": true,
   "providers": [
     "google-antigravity-cli"
