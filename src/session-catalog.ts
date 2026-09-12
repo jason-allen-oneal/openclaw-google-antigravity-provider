@@ -314,7 +314,14 @@ export function registerAntigravitySessionCatalog(
     | { enabled?: boolean }
     | undefined;
   if (sessionCatalog?.enabled === false) return;
-  api.registerSessionCatalog(buildAntigravitySessionCatalog(options));
+  api.registerSessionCatalog({
+    // The catalog reads the user's Antigravity store even when OpenClaw is
+    // running with an isolated process HOME. The provider supplies an
+    // explicit dataDir when configured; this declaration tells the loader it
+    // will not fall back to the isolated process HOME implicitly.
+    supportsProcessHomeIsolation: true,
+    ...buildAntigravitySessionCatalog(options),
+  });
 }
 
 // Aliases used by the CLI backend to check whether a session key came

@@ -6,6 +6,7 @@ import {
   GOOGLE_ANTIGRAVITY_AUTH_MARKER,
   listGoogleAntigravityCatalog,
   MODEL_DEFINITIONS,
+  registerAntigravityCatchUpHook,
 } from "./index.js";
 import { GOOGLE_ANTIGRAVITY_PROVIDER_ID } from "./backend.js";
 import {
@@ -178,6 +179,7 @@ describe("plugin lifecycle registration", () => {
       registerProvider: vi.fn(),
       registerCliBackend: vi.fn(),
       registerModelCatalogProvider: vi.fn(),
+      on: vi.fn(),
     } as any);
 
     expect(registerReload).toHaveBeenCalledWith({
@@ -197,5 +199,18 @@ describe("plugin lifecycle registration", () => {
         },
       }),
     ).toMatch(/configured with 1 model/);
+  });
+
+  it("registers before_prompt_build through the typed hook API", () => {
+    const on = vi.fn();
+    registerAntigravityCatchUpHook({ on } as any);
+
+    expect(on).toHaveBeenCalledWith(
+      "before_prompt_build",
+      expect.any(Function),
+      expect.objectContaining({
+        registrationId: "google-antigravity-cli:catch-up-and-workspace-context",
+      }),
+    );
   });
 });

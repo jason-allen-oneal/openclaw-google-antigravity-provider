@@ -3,11 +3,12 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildAntigravitySessionCatalog,
   conversationIdFromSessionKey,
   isAntigravitySessionKey,
+  registerAntigravitySessionCatalog,
   sessionKeyForConversation,
 } from "./session-catalog.js";
 import { looksLikeTranscriptNoise } from "./session-catalog-sources.js";
@@ -349,6 +350,19 @@ describe("SessionCatalogProvider copyToGatewaySession()", () => {
     await expect(
       (provider as any).copyToGatewaySession({ threadId: "", hostId: "google-antigravity-cli-local" }),
     ).rejects.toThrow(/conversation id/);
+  });
+});
+
+describe("session catalog registration", () => {
+  it("declares support for isolated process homes", () => {
+    const registerSessionCatalog = vi.fn();
+    registerAntigravitySessionCatalog({ registerSessionCatalog } as any, {
+      dataDir: "/tmp/antigravity-catalog-test",
+    });
+
+    expect(registerSessionCatalog).toHaveBeenCalledWith(
+      expect.objectContaining({ supportsProcessHomeIsolation: true }),
+    );
   });
 });
 

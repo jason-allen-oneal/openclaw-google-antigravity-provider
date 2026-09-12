@@ -330,30 +330,16 @@ export function registerAntigravityCatchUpHook(
   api: OpenClawPluginApi,
   providerId = GOOGLE_ANTIGRAVITY_PROVIDER_ID,
 ): void {
-  const register = (api as { registerHook?: unknown }).registerHook;
-  // Older gateways within our supported range may not expose registerHook.
-  // Catch-up is an enhancement, so degrade to the previous behaviour instead
-  // of failing plugin load.
-  if (typeof register !== "function") return;
-
   const tracker = new WorkspaceContextDeliveryTracker();
 
-  // Narrow the openclaw hook payload shape at the boundary. The SDK's
-  // BeforePromptBuild types aren't re-exported from `plugin-entry`; using
-  // structural checks here avoids taking a hard dependency on an internal
-  // subpath that could rename between releases.
-  const readString = (v: unknown): string | undefined =>
-    typeof v === "string" ? v : undefined;
-  const asRecord = (v: unknown): Record<string, unknown> | undefined =>
-    v && typeof v === "object" ? (v as Record<string, unknown>) : undefined;
-
-  api.registerHook(
+  // `before_prompt_build` is a typed plugin hook. The internal
+  // `registerHook()` API accepts the name but does not dispatch underscore
+  // hooks through the typed runner, so using it silently disables this hook.
+  api.on(
     "before_prompt_build",
-    (async (rawEvent: unknown, rawCtx: unknown) => {
-      const event = asRecord(rawEvent) ?? {};
-      const ctx = asRecord(rawCtx) ?? {};
+    async (event, ctx) => {
       // Only our own turns: another provider's turn needs no agy catch-up.
-      const eventProvider = readString(ctx.modelProviderId)?.trim().toLowerCase();
+      const eventProvider = ctx.modelProviderId?.trim().toLowerCase();
       if (eventProvider !== providerId) return;
 
       const blocks: string[] = [];
@@ -361,8 +347,8 @@ export function registerAntigravityCatchUpHook(
       // Workspace instructions first: they frame everything that follows.
       // `ctx.workspaceDir` is resolved per run, so a multi-agent gateway gets
       // each agent's own workspace rather than a shared one.
-      const workspaceDir = readString(ctx.workspaceDir)?.trim() ?? "";
-      const agentId = readString(ctx.agentId);
+      const workspaceDir = ctx.workspaceDir?.trim() ?? "";
+      const agentId = ctx.agentId;
       if (workspaceDir) {
         try {
           const conversationId = await currentConversationId(workspaceDir);
@@ -388,20 +374,18 @@ export function registerAntigravityCatchUpHook(
         }
       }
 
-      const messages = Array.isArray(event.messages) ? event.messages : [];
+      const messages = event.messages;
       const catchUp = buildCrossProviderCatchUp({
         messages,
         providerId,
-        currentPrompt: readString(event.prompt),
+        currentPrompt: event.prompt,
         maxChars: defaultCatchUpMaxChars(),
       });
       if (catchUp) blocks.push(catchUp);
 
       return blocks.length > 0 ? { prependContext: blocks.join("\n\n") } : undefined;
-    }) as never,
-    // OpenClaw 2026.8.x+ requires `name` on every hook registration; without
-    // it plugin registration fails with `hook registration missing name`.
-    { name: `${providerId}:catch-up-and-workspace-context` } as never,
+    },
+    { registrationId: `${providerId}:catch-up-and-workspace-context` },
   );
 }
 
@@ -489,7 +473,16 @@ const plugin: OpenClawPluginDefinition = definePluginEntry({
     // Surfaces existing agy conversations (read-only) in the OpenClaw
     // sidebar. Continues resume via `agy --conversation <id>` through
     // the CLI backend registered above.
-    safeRegister("session-catalog", () => registerAntigravitySessionCatalog(api));
+    safeRegister("session-catalog", () =>
+      registerAntigravitySessionCatalog(api, {
+        dataDir: resolveAntigravityDataDir({
+          ...process.env,
+          ...(typeof api.pluginConfig?.userDataDir === "string"
+            ? { ANTIGRAVITY_USER_DATA_DIR: api.pluginConfig.userDataDir }
+            : {}),
+        }),
+      }),
+    );
     safeRegister("catch-up-hook", () => registerAntigravityCatchUpHook(api));
     // Custom transcript tools — any agent can call these to inspect
     // agy state (`antigravity_conversations_list`, `_read`) or force
