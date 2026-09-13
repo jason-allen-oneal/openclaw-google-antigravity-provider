@@ -200,7 +200,28 @@ The default stays `skip` for compatibility and because it is the only mode that
 runs unattended out of the box — but it does mean every agy tool call is
 auto-approved. Pick `sandbox` or `settings` if that is not acceptable.
 
+### Restricted runs (exact tool caps)
+
+When OpenClaw supplies an exact tool cap, this local release requires **agy
+1.2.1**, an empty native-tool selection, and the plugin's normal Node wrapper.
+Other CLI versions fail closed until their behavior has been verified.
+
+Each restricted run starts a fresh, private custom agent with only the captured
+OpenClaw MCP transport. A generated `PreToolUse` hook allows only the selected
+tool names on that run's unique MCP server; native actions and other servers
+are denied. Restricted runs remove permission-skipping and conversation-resume
+flags, disable slash expansion, and reject unsupported CLI overrides. They do
+not use the HOME-level MCP bridge described below. Private agent/transport files
+are removed when the child exits. Existing unrestricted routing is unchanged.
+
+The cap is a tool-execution restriction, not filesystem sandboxing or a claim
+of root-instruction isolation. The host remains responsible for the authority
+of the selected MCP tools. Restricted runs do not use the shared conversation
+cache as a fallback for binding the user's session.
+
 ### OpenClaw Tools in agy (MCP)
+
+The following shared-config behavior applies to unrestricted runs only.
 
 OpenClaw runs a loopback HTTP MCP server exposing its own tools, and hands the
 CLI child a bearer token for it. `claude-cli` receives that as
@@ -577,7 +598,7 @@ system-prompt flag for any of them to point at, and it does not read an
   budget is OpenClaw's and is not plugin-configurable.
 - **OpenClaw's assembled system prompt still does not reach agy**, only the
   workspace files above. There is no flag to transport it, and with
-  `nativeToolMode: "always-on"` agy owns its own tool surface, so OpenClaw's
+  unrestricted runs agy owns its own tool surface, so OpenClaw's
   tool and channel instructions would describe tools agy does not have.
   Workspace instructions are the part that defines agent behaviour, and those
   now arrive.

@@ -28,6 +28,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { applyOpenClawMcpBridge, resolveAgyMcpConfigPath } from "./mcp-bridge.ts";
 import { stripArgvChannelContext } from "./prompt-strip.ts";
+import { EXACT_CAP_ENV, prepareExactToolExecution } from "./exact-tools.ts";
 
 function resolveRealAgy(env: NodeJS.ProcessEnv): string {
   return env.OPENCLAW_ANTIGRAVITY_REAL_COMMAND?.trim() || "agy";
@@ -58,9 +59,14 @@ async function applyBridge(env: NodeJS.ProcessEnv): Promise<(() => Promise<void>
 async function main(): Promise<never> {
   const strippedArgs = stripArgvChannelContext(process.argv.slice(2));
   const command = resolveRealAgy(process.env);
-  const cleanup = await applyBridge(process.env);
+  // Restricted runs never touch the user's shared MCP configuration. Materialize
+  // their private agent only now, after core has bound the MCP capture attempt.
+  const restricted = process.env[EXACT_CAP_ENV] !== undefined
+    ? await prepareExactToolExecution({ command, args: strippedArgs, env: process.env })
+    : undefined;
+  const cleanup = restricted?.cleanup ?? await applyBridge(process.env);
 
-  const child = spawn(command, strippedArgs, {
+  const child = spawn(command, restricted?.args ?? strippedArgs, {
     stdio: "inherit",
     env: process.env,
   });

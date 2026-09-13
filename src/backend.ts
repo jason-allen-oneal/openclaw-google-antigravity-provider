@@ -6,6 +6,7 @@ import os from "node:os";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { DEFAULT_PRINT_TIMEOUT, formatGoDuration } from "./config.js";
 import { applyOpenClawMcpBridge, resolveAgyMcpConfigPath } from "./mcp-bridge.js";
+import { EXACT_CAP_ENV, restrictExecutionArgs, validateExactCap } from "./exact-tools.ts";
 
 type CliBackendPlugin = Parameters<OpenClawPluginApi["registerCliBackend"]>[0];
 type CliBackendConfig = CliBackendPlugin["config"];
@@ -650,6 +651,19 @@ export function resolveGoogleAntigravityExecutionArgs(
     args.push("--effort", clampEffortForModel(modelIdWithoutProvider, requested));
   }
 
+  if (context.toolAvailability !== undefined) {
+    // Exact-cap argv rewriting is only safe when the wrapper that materializes
+    // the per-run agent and PreToolUse guard is the configured entrypoint. The
+    // wrapper path is an allowed leading token; all other caller-supplied
+    // agent/workspace/tool-selection flags remain rejected by the helper.
+    const wrapper = resolveAgyWrapperInvocation();
+    if (!wrapper.wrapperPath) {
+      throw new Error(
+        "Antigravity exact tool caps require the scoped CLI wrapper",
+      );
+    }
+    return restrictExecutionArgs(args, wrapper.wrapperPath);
+  }
   return args;
 }
 
@@ -688,18 +702,115 @@ function resolveAgyWrapperInvocation(): { command: string; wrapperPath: string |
   }
 }
 
+type ExactCapWrapperConfigSnapshot = {
+  command: string;
+  args: readonly string[];
+  resumeArgs: readonly string[];
+};
+
+function sameStringArray(left: unknown, right: readonly string[]): boolean {
+  return (
+    Array.isArray(left) &&
+    left.length === right.length &&
+    left.every((value, index) => typeof value === "string" && value === right[index])
+  );
+}
+
+const EXACT_CAP_CONTINUATION_CONFIG_KEYS = [
+  "sessionArgs",
+  "forkArg",
+  "resumeAtArg",
+] as const;
+
+function assertNoExactCapContinuationOverrides(
+  value: Record<string, unknown>,
+): void {
+  for (const key of EXACT_CAP_CONTINUATION_CONFIG_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(value, key) && value[key] !== undefined) {
+      throw new Error(
+        `Antigravity exact tool caps reject CLI ${key} override`,
+      );
+    }
+  }
+}
+
+function assertExactCapBackendConfig(params: {
+  backend: CliBackendPlugin;
+  backendId: string;
+  config: unknown;
+  wrapper: { command: string; wrapperPath: string | null };
+  snapshot: ExactCapWrapperConfigSnapshot | undefined;
+}): void {
+  const { backend, backendId, config, wrapper, snapshot } = params;
+  const backendConfig = backend.config as {
+    command?: unknown;
+    args?: unknown;
+    resumeArgs?: unknown;
+    sessionArgs?: unknown;
+    forkArg?: unknown;
+    resumeAtArg?: unknown;
+  };
+
+  assertNoExactCapContinuationOverrides(backendConfig);
+
+  if (
+    !snapshot ||
+    !wrapper.wrapperPath ||
+    wrapper.command !== process.execPath ||
+    snapshot.command !== wrapper.command ||
+    snapshot.args[0] !== wrapper.wrapperPath ||
+    snapshot.resumeArgs[0] !== wrapper.wrapperPath ||
+    backendConfig.command !== snapshot.command ||
+    !sameStringArray(backendConfig.args, snapshot.args) ||
+    !sameStringArray(backendConfig.resumeArgs, snapshot.resumeArgs)
+  ) {
+    throw new Error("Antigravity exact tool caps require the scoped CLI wrapper");
+  }
+
+  const root = config as {
+    agents?: { defaults?: { cliBackends?: unknown } };
+  } | undefined;
+  const entries = root?.agents?.defaults?.cliBackends;
+  if (entries === undefined) return;
+  if (!entries || typeof entries !== "object" || Array.isArray(entries)) {
+    throw new Error("Antigravity exact tool caps reject invalid CLI backend configuration");
+  }
+
+  const table = entries as Record<string, unknown>;
+  const selected = table[backendId] ?? table[GOOGLE_ANTIGRAVITY_PROVIDER_ID];
+  if (selected === undefined) return;
+  if (!selected || typeof selected !== "object" || Array.isArray(selected)) {
+    throw new Error("Antigravity exact tool caps reject invalid CLI backend configuration");
+  }
+
+  const override = selected as Record<string, unknown>;
+  assertNoExactCapContinuationOverrides(override);
+  const hasOwn = (key: string) => Object.prototype.hasOwnProperty.call(override, key);
+  if (hasOwn("command") && override.command !== snapshot.command) {
+    throw new Error("Antigravity exact tool caps reject a CLI command override");
+  }
+  if (hasOwn("args") && !sameStringArray(override.args, snapshot.args)) {
+    throw new Error("Antigravity exact tool caps reject a CLI args override");
+  }
+  if (hasOwn("resumeArgs") && !sameStringArray(override.resumeArgs, snapshot.resumeArgs)) {
+    throw new Error("Antigravity exact tool caps reject CLI resume args override");
+  }
+}
+
 export function buildGoogleAntigravityCliBackend(
   backendId = GOOGLE_ANTIGRAVITY_PROVIDER_ID,
   env: NodeJS.ProcessEnv = process.env,
 ): CliBackendPlugin {
   const userDataDir = resolveAntigravityDataDir(env);
   const conversationCachePath = path.join(userDataDir, "cache", "last_conversations.json");
+  let exactCapWrapperConfigSnapshot: ExactCapWrapperConfigSnapshot | undefined;
 
   const backend: CliBackendPlugin = {
     id: backendId,
     modelProvider: backendId,
     liveTest: { defaultModelRef: `${backendId}/gemini-3.7-flash` },
-    nativeToolMode: "always-on",
+    nativeToolMode: "selectable",
+    toolAvailabilityEnforcement: "prepare-execution",
     ownsNativeCompaction: true,
     // Ask openclaw to stand up its loopback MCP server and materialise a
     // config for this run. `gemini-system-settings` is the right mode of the
@@ -713,9 +824,24 @@ export function buildGoogleAntigravityCliBackend(
     normalizeConfig: normalizeGoogleAntigravityBackendConfig,
     resolveExecutionArgs: resolveGoogleAntigravityExecutionArgs,
     prepareExecution: async (ctx) => {
+      const cap = ctx.toolAvailability === undefined ? undefined : validateExactCap(ctx.toolAvailability);
       const cwd = (ctx as { cwd?: string; workspaceDir: string }).cwd ?? ctx.workspaceDir;
       let priorConversationId: string | undefined;
       let stagedAtMs = 0;
+
+      if (cap) {
+        // The exact-cap acknowledgement is meaningful only when the command
+        // that core will launch is our wrapper with the matching wrapper
+        // prefix. A raw-agy fallback would otherwise receive the positive
+        // acknowledgement but run with its ambient native tools.
+        assertExactCapBackendConfig({
+          backend,
+          backendId,
+          config: ctx.config,
+          wrapper: resolveAgyWrapperInvocation(),
+          snapshot: exactCapWrapperConfigSnapshot,
+        });
+      }
 
       // MCP bridge moved to src/agy-strip-wrapper.ts so it can read the
       // POST-capture-attempt `GEMINI_CLI_SYSTEM_SETTINGS_PATH`. openclaw's
@@ -730,19 +856,23 @@ export function buildGoogleAntigravityCliBackend(
       );
 
       return {
+        ...(cap ? { toolAvailabilityEnforced: true } : {}),
         ...(normalizeOptionalString(env.ANTIGRAVITY_USER_DATA_DIR)
           ? {
               env: {
                 ANTIGRAVITY_USER_DATA_DIR: userDataDir,
                 OPENCLAW_ANTIGRAVITY_EXPOSE_TOOLS: String(exposeTools),
+                ...(cap ? { [EXACT_CAP_ENV]: JSON.stringify(cap) } : {}),
               },
             }
           : {
               env: {
                 OPENCLAW_ANTIGRAVITY_EXPOSE_TOOLS: String(exposeTools),
+                ...(cap ? { [EXACT_CAP_ENV]: JSON.stringify(cap) } : {}),
               },
             }),
         clearEnv: [
+          ...(cap ? [] : [EXACT_CAP_ENV]),
           "GEMINI_API_KEY",
           "GOOGLE_API_KEY",
           "GOOGLE_APPLICATION_CREDENTIALS",
@@ -757,7 +887,11 @@ export function buildGoogleAntigravityCliBackend(
           stagedAtMs = Date.now();
         },
         captureSessionId: async (captureCtx: { cwd: string; executionMode?: string }) => {
-          if (captureCtx.executionMode === "side-question") return;
+          // Restricted runs deliberately use a fresh, private agy
+          // conversation. Do not bind that transient conversation into the
+          // user's OpenClaw session; doing so would make a later unrestricted
+          // turn resume a conversation created under the exact-cap guard.
+          if (cap || captureCtx.executionMode === "side-question") return;
           const conversationId = await resolveCachedConversationId({
             cachePath: conversationCachePath,
             cwd: captureCtx.cwd,
@@ -843,6 +977,28 @@ export function buildGoogleAntigravityCliBackend(
       };
     })(),
   };
+
+  // Keep an immutable copy of the wrapper-owned argv contract. The live
+  // backend config can be normalized or replaced by core before preparation;
+  // exact-cap validation must compare against this plugin-owned baseline.
+  const configured = backend.config as {
+    command?: unknown;
+    args?: unknown;
+    resumeArgs?: unknown;
+  };
+  if (
+    typeof configured.command === "string" &&
+    Array.isArray(configured.args) &&
+    Array.isArray(configured.resumeArgs) &&
+    configured.args.every((value): value is string => typeof value === "string") &&
+    configured.resumeArgs.every((value): value is string => typeof value === "string")
+  ) {
+    exactCapWrapperConfigSnapshot = {
+      command: configured.command,
+      args: [...configured.args],
+      resumeArgs: [...configured.resumeArgs],
+    };
+  }
 
   (backend as any).parseJsonlEvent = parseGoogleAntigravityJsonlEvent;
   // No `manualCompaction`: agy exposes no compaction command. Its slash-command

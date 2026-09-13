@@ -21,7 +21,8 @@ describe("google-antigravity-cli CLI backend", () => {
     const backend = buildGoogleAntigravityCliBackend();
 
     expect(backend.id).toBe(GOOGLE_ANTIGRAVITY_PROVIDER_ID);
-    expect(backend.nativeToolMode).toBe("always-on");
+    expect(backend.nativeToolMode).toBe("selectable");
+    expect(backend.toolAvailabilityEnforcement).toBe("prepare-execution");
     expect(backend.ownsNativeCompaction).toBe(true);
     expect(typeof (backend as any).parseJsonlEvent).toBe("function");
     // command is now node's own execPath (spawning the strip-wrapper) so
@@ -587,6 +588,7 @@ describe("google-antigravity-cli CLI backend", () => {
           OPENCLAW_ANTIGRAVITY_EXPOSE_TOOLS: "true",
         },
         clearEnv: [
+          "OPENCLAW_ANTIGRAVITY_EXACT_TOOL_CAP",
           "GEMINI_API_KEY",
           "GOOGLE_API_KEY",
           "GOOGLE_APPLICATION_CREDENTIALS",
@@ -595,6 +597,67 @@ describe("google-antigravity-cli CLI backend", () => {
         ],
       }),
     );
+  });
+
+  it("does not bind a capped run's fresh conversation into the user session", async () => {
+    const backend = buildGoogleAntigravityCliBackend("google-antigravity-cli", {});
+    const prepared = await backend.prepareExecution!({
+      workspaceDir: "/tmp/workspace",
+      provider: GOOGLE_ANTIGRAVITY_PROVIDER_ID,
+      modelId: "gemini-3.7-flash",
+      toolAvailability: { native: [], openClaw: ["read"] },
+    } as any) as any;
+
+    expect(prepared.toolAvailabilityEnforced).toBe(true);
+    await expect(
+      prepared.captureSessionId({ cwd: "/path-that-must-not-be-read" }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("fails closed instead of acknowledging an overridden exact-cap command", async () => {
+    const backend = buildGoogleAntigravityCliBackend("google-antigravity-cli", {});
+    const originalCommand = backend.config.command;
+    backend.config.command = "/bin/false";
+    try {
+      await expect(
+        backend.prepareExecution!({
+          workspaceDir: "/tmp/workspace",
+          provider: GOOGLE_ANTIGRAVITY_PROVIDER_ID,
+          modelId: "gemini-3.7-flash",
+          toolAvailability: { native: [], openClaw: [] },
+        } as any),
+      ).rejects.toThrow("scoped CLI wrapper");
+    } finally {
+      backend.config.command = originalCommand;
+    }
+  });
+
+  it.each([
+    ["command", { command: "/bin/false" }],
+    ["args", { args: ["/bin/false", "--print", "{prompt}"] }],
+    ["resumeArgs", { resumeArgs: ["/bin/false", "--conversation", "{sessionId}"] }],
+    ["sessionArgs", { sessionArgs: ["--conversation", "ambient"] }],
+    ["forkArg", { forkArg: "--fork" }],
+    ["resumeAtArg", { resumeAtArg: "--resume-at" }],
+  ])("rejects an effective cliBackends %s override for capped runs", async (_label, override) => {
+    const backend = buildGoogleAntigravityCliBackend("google-antigravity-cli", {});
+    await expect(
+      backend.prepareExecution!({
+        workspaceDir: "/tmp/workspace",
+        provider: GOOGLE_ANTIGRAVITY_PROVIDER_ID,
+        modelId: "gemini-3.7-flash",
+        config: {
+          agents: {
+            defaults: {
+              cliBackends: {
+                [GOOGLE_ANTIGRAVITY_PROVIDER_ID]: override,
+              },
+            },
+          },
+        },
+        toolAvailability: { native: [], openClaw: [] },
+      } as any),
+    ).rejects.toThrow(/CLI (?:command|args|resume args|sessionArgs|forkArg|resumeAtArg) override/i);
   });
 
   describe("permission mode", () => {
