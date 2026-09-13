@@ -202,7 +202,7 @@ auto-approved. Pick `sandbox` or `settings` if that is not acceptable.
 
 ### Restricted runs (exact tool caps)
 
-When OpenClaw supplies an exact tool cap, this local release requires **agy
+When OpenClaw supplies an exact tool cap, this release requires **agy
 1.2.1**, an empty native-tool selection, and the plugin's normal Node wrapper.
 Other CLI versions fail closed until their behavior has been verified.
 
